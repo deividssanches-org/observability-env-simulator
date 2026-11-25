@@ -1,0 +1,126 @@
+name: observability-env-simulator
+
+# Every value has a working default, so `docker compose up --build -d` needs no
+# .env file. Copy .env.example to .env to override anything.
+
+x-appevents-worker: &appevents-worker
+  build: ./integrations
+  image: observability-env-simulator/appevents-worker:local
+  restart: unless-stopped
+  depends_on:
+    technology-one-sm:
+      condition: service_healthy
+    # No dependency on edw: workers must start and keep running while it is down.
+  stop_grace_period: 10s
+
+x-appevents-env: &appevents-env
+  SOURCE_BASE_URL: ${SOURCE_BASE_URL:-http://technology-one-sm:8000}
+  TARGET_BASE_URL: ${TARGET_BASE_URL:-http://edw:8000}
+  API_TOKEN: ${API_TOKEN:-dev-poc-token}
+  SYNC_INTERVAL_SECONDS: ${SYNC_INTERVAL_SECONDS:-30}
+  HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-5}
+  HTTP_MAX_RETRIES: ${HTTP_MAX_RETRIES:-1}
+  HTTP_RETRY_BACKOFF_SECONDS: ${HTTP_RETRY_BACKOFF_SECONDS:-1}
+  SOURCE_STARTUP_WAIT_SECONDS: ${SOURCE_STARTUP_WAIT_SECONDS:-60}
+  METRICS_PORT: "9100"
+  PROMETHEUS_DISABLE_CREATED_SERIES: "true"
+
+services:
+  technology-one-sm-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SOURCE_DB_NAME:-technology_one_sm}
+      POSTGRES_USER: ${SOURCE_DB_USER:-technology_one_sm}
+      POSTGRES_PASSWORD: ${SOURCE_DB_PASSWORD:-source-dev-password}
+    volumes:
+      - technology-one-sm-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  edw-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${TARGET_DB_NAME:-edw}
+      POSTGRES_USER: ${TARGET_DB_USER:-edw}
+      POSTGRES_PASSWORD: ${TARGET_DB_PASSWORD:-target-dev-password}
+    volumes:
+      - edw-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  technology-one-sm:
+    build: ./app-technology-one-sm
+    image: observability-env-simulator/technology-one-sm:local
+    restart: unless-stopped
+    depends_on:
+      technology-one-sm-db:
+        condition: service_healthy
+    environment:
+      APP_NAME: technology-one-sm
+      DATABASE_URL: postgresql://${SOURCE_DB_USER:-technology_one_sm}:${SOURCE_DB_PASSWORD:-source-dev-password}@technology-one-sm-db:5432/${SOURCE_DB_NAME:-technology_one_sm}
+      API_TOKEN: ${API_TOKEN:-dev-poc-token}
+      PROMETHEUS_DISABLE_CREATED_SERIES: "true"
+    ports:
+      - "0.0.0.0:${SOURCE_HOST_PORT:-8001}:8000"
+
+  edw:
+    build: ./app-edw
+    image: observability-env-simulator/edw:local
+    # unless-stopped: recovers from crashes, but `docker compose stop edw`
+    # keeps it down until `docker compose start edw`.
+    restart: unless-stopped
+    depends_on:
+      edw-db:
+        condition: service_healthy
+    environment:
+      APP_NAME: edw
+      DATABASE_URL: postgresql://${TARGET_DB_USER:-edw}:${TARGET_DB_PASSWORD:-target-dev-password}@edw-db:5432/${TARGET_DB_NAME:-edw}
+      API_TOKEN: ${API_TOKEN:-dev-poc-token}
+      PROMETHEUS_DISABLE_CREATED_SERIES: "true"
+    ports:
+      - "0.0.0.0:${TARGET_HOST_PORT:-8002}:8000"
+
+  appevents-student:
+    <<: *appevents-worker
+    environment:
+      <<: *appevents-env
+      INTEGRATION: student
+    ports:
+      - "0.0.0.0:${APPEVENTS_STUDENT_METRICS_PORT:-9101}:9100"
+
+  appevents-general:
+    <<: *appevents-worker
+    environment:
+      <<: *appevents-env
+      INTEGRATION: general
+    ports:
+      - "0.0.0.0:${APPEVENTS_GENERAL_METRICS_PORT:-9102}:9100"
+
+  appevents-curriculum:
+    <<: *appevents-worker
+    environment:
+      <<: *appevents-env
+      INTEGRATION: curriculum
+    ports:
+      - "0.0.0.0:${APPEVENTS_CURRICULUM_METRICS_PORT:-9103}:9100"
+
+volumes:
+  technology-one-sm-db-data:
+  edw-db-data:
+
+# Fixed network name so the separate observability-platform stack can scrape these
+# services by name (edw:8000, appevents-student:9100, ...).
+# Shared network: both repos declare the same named network, so either stack can
+# start or stop first. Whichever starts second logs a harmless warning that the
+# network "was not created for project ...": that is expected.
+networks:
+  default:
+    name: observability-sim
